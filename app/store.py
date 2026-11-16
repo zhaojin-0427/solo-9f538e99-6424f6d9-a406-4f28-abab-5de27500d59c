@@ -96,9 +96,51 @@ CREATE TABLE IF NOT EXISTS snapshots (
     published_at TEXT NOT NULL,
     PRIMARY KEY (symbol, trade_date, upto_seq)
 );
+
+-- One realtime collection session per symbol/day (see app.collector).
+CREATE TABLE IF NOT EXISTS collectors (
+    symbol                TEXT    NOT NULL,
+    trade_date            TEXT    NOT NULL,
+    udp_port              INTEGER NOT NULL,
+    source_url            TEXT    NOT NULL,
+    poll_interval_seconds REAL    NOT NULL,
+    status                TEXT    NOT NULL DEFAULT 'running'
+                          CHECK (status IN ('running', 'paused')),
+    pause_reason          TEXT,
+    pause_seq             INTEGER,
+    pause_detail          TEXT,
+    source_latest_seq     INTEGER,
+    created_at            TEXT    NOT NULL,
+    updated_at            TEXT    NOT NULL,
+    PRIMARY KEY (symbol, trade_date)
+);
+
+-- Realtime/backfilled messages received but not yet committed.  They are
+-- persisted so that, even across restarts, a retransmission of the same
+-- sequence with different content is still detected (同号异文核对) and only a
+-- contiguous, rule-valid prefix is ever committed to the event log.
+CREATE TABLE IF NOT EXISTS pending_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT    NOT NULL,
+    trade_date  TEXT    NOT NULL,
+    seq         INTEGER NOT NULL,
+    kind        TEXT    NOT NULL CHECK (kind IN ('trade', 'correction', 'cancel')),
+    trade_id    INTEGER NOT NULL,
+    exec_time   TEXT,
+    exec_ts_us  INTEGER,
+    price       TEXT,
+    quantity    INTEGER,
+    source      TEXT    NOT NULL CHECK (source IN ('udp', 'backfill')),
+    received_at TEXT    NOT NULL,
+    UNIQUE (symbol, trade_date, seq)
+);
 """
 
 MAX_EVENTS_PER_DAY = 100
+
+# Upper bound on pending rows scanned per commit round; the loop repeats, so
+# this only bounds a single SELECT, never the committed total.
+_PENDING_READ_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -122,6 +164,26 @@ class UploadResult:
     created: bool
     accepted_events: int
     replayed_events: int
+
+
+@dataclass(frozen=True)
+class IngestOutcome:
+    """Result of offering one realtime/backfilled message to a collection."""
+
+    kind: str  # "added" | "duplicate_committed" | "duplicate_pending" | "conflict"
+    seq: int
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class CommitOutcome:
+    """Result of trying to commit the contiguous pending prefix."""
+
+    committed: int
+    paused: bool
+    pause_reason: str | None = None
+    pause_seq: int | None = None
+    pause_detail: str | None = None
 
 
 def _now_text() -> str:
@@ -291,148 +353,166 @@ class Store:
 
         with self._lock:
             with self._write_transaction() as connection:
-                current = self._watermark(connection, symbol, date_text)
-                target = events[-1].seq
+                return self._append_locked(
+                    connection, symbol, date_text, events, max_events
+                )
 
-                replayed = [event for event in events if event.seq <= current]
-                fresh = [event for event in events if event.seq > current]
+    def _append_locked(
+        self,
+        connection: sqlite3.Connection,
+        symbol: str,
+        date_text: str,
+        events: list[EventInput],
+        max_events: int,
+    ) -> UploadResult:
+        """Append ``events`` inside an already-open write transaction.
 
-                # Every replayed message must be byte-for-byte the same
-                # exchange message; anything else is a conflicting retransmit.
-                for event in replayed:
-                    row = self._event_at(connection, symbol, date_text, event.seq)
-                    if row is None or not self._matches(row, event):
-                        raise DomainError(
-                            409,
-                            "sequence_conflict",
-                            "sequence number already accepted with different content",
-                            seq=event.seq,
-                            version=current,
-                        )
+        Shared by ``append_upload`` (HTTP batches) and the collection
+        pipeline, which commits contiguous pending runs and must delete the
+        pending rows in the same transaction as the event-log insert.
+        """
+        current = self._watermark(connection, symbol, date_text)
+        target = events[-1].seq
 
-                if fresh and fresh[0].seq != current + 1:
+        replayed = [event for event in events if event.seq <= current]
+        fresh = [event for event in events if event.seq > current]
+
+        # Every replayed message must be byte-for-byte the same
+        # exchange message; anything else is a conflicting retransmit.
+        for event in replayed:
+            row = self._event_at(connection, symbol, date_text, event.seq)
+            if row is None or not self._matches(row, event):
+                raise DomainError(
+                    409,
+                    "sequence_conflict",
+                    "sequence number already accepted with different content",
+                    seq=event.seq,
+                    version=current,
+                )
+
+        if fresh and fresh[0].seq != current + 1:
+            raise DomainError(
+                409,
+                "sequence_gap",
+                "new messages must continue at the accepted high-water mark",
+                expected_seq=current + 1,
+                received_seq=fresh[0].seq,
+                version=current,
+            )
+
+        if not fresh:
+            # The original result of a pure retransmission is the
+            # upload that first accepted the batch's last sequence.
+            # (A retransmitted range may span two uploads; the last
+            # sequence is the one that identifies the result.)
+            owner = connection.execute(
+                "SELECT * FROM uploads WHERE symbol = ? AND trade_date = ?"
+                " AND version >= ? ORDER BY version LIMIT 1",
+                (symbol, date_text, target),
+            ).fetchone()
+            if owner is None:  # pragma: no cover - log invariant
+                raise RuntimeError("no upload owns the replayed sequences")
+            return UploadResult(
+                upload_id=int(owner["id"]),
+                version=int(owner["version"]),
+                created=False,
+                accepted_events=0,
+                replayed_events=len(replayed),
+            )
+
+        if target > max_events:
+            raise DomainError(
+                422,
+                "daily_limit_exceeded",
+                f"at most {max_events} cumulative messages per symbol per trading day",
+                limit=max_events,
+                requested_through_seq=target,
+                version=current,
+            )
+
+        states = self._state_as_of(connection, symbol, date_text, current)
+        for event in fresh:
+            state = states.get(event.trade_id)
+            if event.kind == "trade":
+                if state is not None:
                     raise DomainError(
                         409,
-                        "sequence_gap",
-                        "new messages must continue at the accepted high-water mark",
-                        expected_seq=current + 1,
-                        received_seq=fresh[0].seq,
-                        version=current,
+                        "duplicate_trade_id",
+                        "trade_id must be unique for this symbol and date",
+                        trade_id=event.trade_id,
+                        seq=event.seq,
                     )
-
-                if not fresh:
-                    # The original result of a pure retransmission is the
-                    # upload that first accepted the batch's last sequence.
-                    # (A retransmitted range may span two uploads; the last
-                    # sequence is the one that identifies the result.)
-                    owner = connection.execute(
-                        "SELECT * FROM uploads WHERE symbol = ? AND trade_date = ?"
-                        " AND version >= ? ORDER BY version LIMIT 1",
-                        (symbol, date_text, target),
-                    ).fetchone()
-                    if owner is None:  # pragma: no cover - log invariant
-                        raise RuntimeError("no upload owns the replayed sequences")
-                    return UploadResult(
-                        upload_id=int(owner["id"]),
-                        version=int(owner["version"]),
-                        created=False,
-                        accepted_events=0,
-                        replayed_events=len(replayed),
-                    )
-
-                if target > max_events:
-                    raise DomainError(
-                        422,
-                        "daily_limit_exceeded",
-                        f"at most {max_events} cumulative messages per symbol per trading day",
-                        limit=max_events,
-                        requested_through_seq=target,
-                        version=current,
-                    )
-
-                states = self._state_as_of(connection, symbol, date_text, current)
-                for event in fresh:
-                    state = states.get(event.trade_id)
-                    if event.kind == "trade":
-                        if state is not None:
-                            raise DomainError(
-                                409,
-                                "duplicate_trade_id",
-                                "trade_id must be unique for this symbol and date",
-                                trade_id=event.trade_id,
-                                seq=event.seq,
-                            )
-                        states[event.trade_id] = TradeState(
-                            trade_id=event.trade_id,
-                            exec_ts_us=event.exec_ts_us,
-                            exec_time=event.exec_time,
-                            price=Decimal(event.price),
-                            quantity=event.quantity,
-                            status="active",
-                            origin_seq=event.seq,
-                            last_seq=event.seq,
-                        )
-                    elif state is None:
-                        raise DomainError(
-                            422,
-                            "unknown_trade",
-                            "message references a trade that does not exist",
-                            trade_id=event.trade_id,
-                            seq=event.seq,
-                        )
-                    elif state.status == "cancelled":
-                        raise DomainError(
-                            409,
-                            "trade_cancelled",
-                            "a cancelled trade can no longer be corrected or cancelled",
-                            trade_id=event.trade_id,
-                            seq=event.seq,
-                        )
-                    elif event.kind == "correction":
-                        states[event.trade_id] = replace(
-                            state,
-                            price=Decimal(event.price),
-                            quantity=event.quantity,
-                            last_seq=event.seq,
-                        )
-                    else:  # cancel
-                        states[event.trade_id] = replace(
-                            state, status="cancelled", last_seq=event.seq
-                        )
-
-                cursor = connection.execute(
-                    "INSERT INTO uploads (symbol, trade_date, version, event_count,"
-                    " created_at) VALUES (?, ?, ?, ?, ?)",
-                    (symbol, date_text, target, len(fresh), _now_text()),
+                states[event.trade_id] = TradeState(
+                    trade_id=event.trade_id,
+                    exec_ts_us=event.exec_ts_us,
+                    exec_time=event.exec_time,
+                    price=Decimal(event.price),
+                    quantity=event.quantity,
+                    status="active",
+                    origin_seq=event.seq,
+                    last_seq=event.seq,
                 )
-                upload_id = int(cursor.lastrowid)
-                connection.executemany(
-                    "INSERT INTO events (symbol, trade_date, seq, kind, trade_id,"
-                    " exec_time, exec_ts_us, price, quantity, upload_id)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        (
-                            symbol,
-                            date_text,
-                            event.seq,
-                            event.kind,
-                            event.trade_id,
-                            event.exec_time,
-                            event.exec_ts_us,
-                            event.price,
-                            event.quantity,
-                            upload_id,
-                        )
-                        for event in fresh
-                    ],
+            elif state is None:
+                raise DomainError(
+                    422,
+                    "unknown_trade",
+                    "message references a trade that does not exist",
+                    trade_id=event.trade_id,
+                    seq=event.seq,
                 )
-                return UploadResult(
-                    upload_id=upload_id,
-                    version=target,
-                    created=True,
-                    accepted_events=len(fresh),
-                    replayed_events=len(replayed),
+            elif state.status == "cancelled":
+                raise DomainError(
+                    409,
+                    "trade_cancelled",
+                    "a cancelled trade can no longer be corrected or cancelled",
+                    trade_id=event.trade_id,
+                    seq=event.seq,
                 )
+            elif event.kind == "correction":
+                states[event.trade_id] = replace(
+                    state,
+                    price=Decimal(event.price),
+                    quantity=event.quantity,
+                    last_seq=event.seq,
+                )
+            else:  # cancel
+                states[event.trade_id] = replace(
+                    state, status="cancelled", last_seq=event.seq
+                )
+
+        cursor = connection.execute(
+            "INSERT INTO uploads (symbol, trade_date, version, event_count,"
+            " created_at) VALUES (?, ?, ?, ?, ?)",
+            (symbol, date_text, target, len(fresh), _now_text()),
+        )
+        upload_id = int(cursor.lastrowid)
+        connection.executemany(
+            "INSERT INTO events (symbol, trade_date, seq, kind, trade_id,"
+            " exec_time, exec_ts_us, price, quantity, upload_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    symbol,
+                    date_text,
+                    event.seq,
+                    event.kind,
+                    event.trade_id,
+                    event.exec_time,
+                    event.exec_ts_us,
+                    event.price,
+                    event.quantity,
+                    upload_id,
+                )
+                for event in fresh
+            ],
+        )
+        return UploadResult(
+            upload_id=upload_id,
+            version=target,
+            created=True,
+            accepted_events=len(fresh),
+            replayed_events=len(replayed),
+        )
 
     # -- snapshots --------------------------------------------------------
     def publish(
@@ -554,6 +634,363 @@ class Store:
             "event_count": event_count,
             "uploads": uploads,
             "snapshots": snapshots,
+        }
+
+    # -- collectors (realtime gap-filling collection) ---------------------
+    def create_collector(
+        self,
+        symbol: str,
+        trade_date: date,
+        udp_port: int,
+        source_url: str,
+        poll_interval_seconds: float,
+    ) -> dict:
+        date_text = trade_date.isoformat()
+        with self._lock:
+            with self._write_transaction() as connection:
+                existing = self._collector_row(connection, symbol, date_text)
+                if existing is not None:
+                    raise DomainError(
+                        409,
+                        "collector_exists",
+                        "a collector already exists for this symbol and date",
+                    )
+                if udp_port != 0:
+                    port_owner = connection.execute(
+                        "SELECT symbol, trade_date FROM collectors WHERE udp_port = ?",
+                        (udp_port,),
+                    ).fetchone()
+                    if port_owner is not None:
+                        raise DomainError(
+                            409,
+                            "udp_port_in_use",
+                            "another collector already listens on this UDP port",
+                            udp_port=udp_port,
+                            owner_symbol=port_owner["symbol"],
+                            owner_trade_date=port_owner["trade_date"],
+                        )
+                now = _now_text()
+                connection.execute(
+                    "INSERT INTO collectors (symbol, trade_date, udp_port, source_url,"
+                    " poll_interval_seconds, status, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, 'running', ?, ?)",
+                    (symbol, date_text, udp_port, source_url,
+                     poll_interval_seconds, now, now),
+                )
+                return self._collector_payload(
+                    self._collector_row(connection, symbol, date_text)
+                )
+
+    @staticmethod
+    def _collector_row(
+        connection: sqlite3.Connection, symbol: str, date_text: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT * FROM collectors WHERE symbol = ? AND trade_date = ?",
+            (symbol, date_text),
+        ).fetchone()
+
+    @staticmethod
+    def _collector_payload(row: sqlite3.Row) -> dict:
+        return {
+            "symbol": row["symbol"],
+            "trade_date": row["trade_date"],
+            "udp_port": int(row["udp_port"]),
+            "source_url": row["source_url"],
+            "poll_interval_seconds": float(row["poll_interval_seconds"]),
+            "status": row["status"],
+            "pause_reason": row["pause_reason"],
+            "pause_seq": row["pause_seq"],
+            "pause_detail": row["pause_detail"],
+            "source_latest_seq": row["source_latest_seq"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def get_collector(self, symbol: str, trade_date: date) -> dict | None:
+        with self._lock:
+            row = self._collector_row(self._conn, symbol, trade_date.isoformat())
+            return None if row is None else self._collector_payload(row)
+
+    def list_collectors(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM collectors ORDER BY symbol, trade_date"
+            ).fetchall()
+            return [self._collector_payload(row) for row in rows]
+
+    def set_collector_udp_port(
+        self, symbol: str, trade_date: date, udp_port: int
+    ) -> None:
+        """Persist the effective port after an ephemeral (0) bind succeeds."""
+        with self._lock:
+            with self._write_transaction() as connection:
+                connection.execute(
+                    "UPDATE collectors SET udp_port = ?, updated_at = ?"
+                    " WHERE symbol = ? AND trade_date = ?",
+                    (udp_port, _now_text(), symbol, trade_date.isoformat()),
+                )
+
+    def resume_collector(self, symbol: str, trade_date: date) -> dict:
+        """Clear the pause and mark the collector running again."""
+        date_text = trade_date.isoformat()
+        with self._lock:
+            with self._write_transaction() as connection:
+                row = self._collector_row(connection, symbol, date_text)
+                if row is None:
+                    raise DomainError(
+                        404, "collector_not_found",
+                        "no collector for this symbol and date",
+                    )
+                connection.execute(
+                    "UPDATE collectors SET status = 'running', pause_reason = NULL,"
+                    " pause_seq = NULL, pause_detail = NULL, updated_at = ?"
+                    " WHERE symbol = ? AND trade_date = ?",
+                    (_now_text(), symbol, date_text),
+                )
+                return self._collector_payload(
+                    self._collector_row(connection, symbol, date_text)
+                )
+
+    def pause_collector(
+        self,
+        symbol: str,
+        trade_date: date,
+        reason: str,
+        seq: int | None,
+        detail: str,
+    ) -> None:
+        date_text = trade_date.isoformat()
+        with self._lock:
+            with self._write_transaction() as connection:
+                self._pause_locked(connection, symbol, date_text, reason, seq, detail)
+
+    @staticmethod
+    def _pause_locked(
+        connection: sqlite3.Connection,
+        symbol: str,
+        date_text: str,
+        reason: str,
+        seq: int | None,
+        detail: str,
+    ) -> None:
+        # Only a running collector transitions to paused; an existing pause
+        # (and its original sequence number) is never overwritten.
+        connection.execute(
+            "UPDATE collectors SET status = 'paused', pause_reason = ?,"
+            " pause_seq = ?, pause_detail = ?, updated_at = ?"
+            " WHERE symbol = ? AND trade_date = ? AND status = 'running'",
+            (reason, seq, detail, _now_text(), symbol, date_text),
+        )
+
+    def note_source_latest(
+        self, symbol: str, trade_date: date, latest_seq: int
+    ) -> None:
+        with self._lock:
+            with self._write_transaction() as connection:
+                connection.execute(
+                    "UPDATE collectors SET source_latest_seq = ?, updated_at = ?"
+                    " WHERE symbol = ? AND trade_date = ?",
+                    (latest_seq, _now_text(), symbol, trade_date.isoformat()),
+                )
+
+    def delete_collector(self, symbol: str, trade_date: date) -> bool:
+        """Remove the collector and its uncommitted buffer; committed events stay."""
+        date_text = trade_date.isoformat()
+        with self._lock:
+            with self._write_transaction() as connection:
+                cursor = connection.execute(
+                    "DELETE FROM collectors WHERE symbol = ? AND trade_date = ?",
+                    (symbol, date_text),
+                )
+                connection.execute(
+                    "DELETE FROM pending_events WHERE symbol = ? AND trade_date = ?",
+                    (symbol, date_text),
+                )
+                return cursor.rowcount > 0
+
+    # -- collection pipeline ----------------------------------------------
+    @staticmethod
+    def _pending_to_event(row: sqlite3.Row) -> EventInput:
+        return EventInput(
+            seq=int(row["seq"]),
+            kind=row["kind"],
+            trade_id=int(row["trade_id"]),
+            exec_time=row["exec_time"],
+            exec_ts_us=None if row["exec_ts_us"] is None else int(row["exec_ts_us"]),
+            price=row["price"],
+            quantity=None if row["quantity"] is None else int(row["quantity"]),
+        )
+
+    def ingest_message(
+        self, symbol: str, trade_date: date, event: EventInput, source: str
+    ) -> IngestOutcome:
+        """Buffer one realtime/backfilled message, detecting retransmissions.
+
+        A message at or below the committed watermark, or already buffered,
+        is a no-op when identical and a conflict when the content differs.
+        Conflicts pause the collector (recording the sequence number) and
+        never touch committed data or the previously buffered message.
+        """
+        date_text = trade_date.isoformat()
+        with self._lock:
+            with self._write_transaction() as connection:
+                watermark = self._watermark(connection, symbol, date_text)
+                if event.seq <= watermark:
+                    row = self._event_at(connection, symbol, date_text, event.seq)
+                    if row is not None and self._matches(row, event):
+                        return IngestOutcome("duplicate_committed", event.seq)
+                    detail = (
+                        "message conflicts with already committed data at this"
+                        " sequence number"
+                    )
+                    self._pause_locked(
+                        connection, symbol, date_text,
+                        "sequence_conflict", event.seq, detail,
+                    )
+                    return IngestOutcome("conflict", event.seq, detail)
+
+                row = connection.execute(
+                    "SELECT * FROM pending_events"
+                    " WHERE symbol = ? AND trade_date = ? AND seq = ?",
+                    (symbol, date_text, event.seq),
+                ).fetchone()
+                if row is not None:
+                    if self._matches(row, event):
+                        return IngestOutcome("duplicate_pending", event.seq)
+                    detail = (
+                        "message conflicts with an uncommitted buffered message"
+                        " at this sequence number"
+                    )
+                    self._pause_locked(
+                        connection, symbol, date_text,
+                        "sequence_conflict", event.seq, detail,
+                    )
+                    return IngestOutcome("conflict", event.seq, detail)
+
+                connection.execute(
+                    "INSERT INTO pending_events (symbol, trade_date, seq, kind,"
+                    " trade_id, exec_time, exec_ts_us, price, quantity, source,"
+                    " received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        symbol, date_text, event.seq, event.kind, event.trade_id,
+                        event.exec_time, event.exec_ts_us, event.price,
+                        event.quantity, source, _now_text(),
+                    ),
+                )
+                return IngestOutcome("added", event.seq)
+
+    def commit_pending(self, symbol: str, trade_date: date) -> CommitOutcome:
+        """Commit the longest contiguous, rule-valid pending prefix.
+
+        Only sequences forming an unbroken run above the committed watermark
+        are eligible, and they are appended through the same validation as
+        HTTP uploads (trade/correction/cancel rules and the daily cap), so
+        the collection progress can never exceed the committed watermark.
+        A message that violates a rule pauses the collector at exactly that
+        sequence; everything valid before it is still committed.
+        """
+        date_text = trade_date.isoformat()
+        committed = 0
+        with self._lock:
+            while True:
+                watermark = self._watermark(self._conn, symbol, date_text)
+                rows = self._conn.execute(
+                    "SELECT * FROM pending_events"
+                    " WHERE symbol = ? AND trade_date = ? AND seq > ?"
+                    " ORDER BY seq LIMIT ?",
+                    (symbol, date_text, watermark, _PENDING_READ_LIMIT),
+                ).fetchall()
+                run: list[EventInput] = []
+                expected = watermark + 1
+                for row in rows:
+                    if int(row["seq"]) != expected:
+                        break
+                    run.append(self._pending_to_event(row))
+                    expected += 1
+                if not run:
+                    return CommitOutcome(committed=committed, paused=False)
+
+                try:
+                    with self._write_transaction() as connection:
+                        self._append_locked(
+                            connection, symbol, date_text, run, MAX_EVENTS_PER_DAY
+                        )
+                        connection.execute(
+                            f"DELETE FROM pending_events WHERE symbol = ?"
+                            f" AND trade_date = ? AND seq IN"
+                            f" ({','.join('?' for _ in run)})",
+                            (symbol, date_text, *[event.seq for event in run]),
+                        )
+                except DomainError:
+                    # The run as a whole is not commitable (e.g. one bad
+                    # message or the daily cap).  Commit the valid prefix one
+                    # message at a time so the pause lands exactly on the
+                    # first offending sequence.
+                    for event in run:
+                        try:
+                            with self._write_transaction() as connection:
+                                self._append_locked(
+                                    connection, symbol, date_text, [event],
+                                    MAX_EVENTS_PER_DAY,
+                                )
+                                connection.execute(
+                                    "DELETE FROM pending_events WHERE symbol = ?"
+                                    " AND trade_date = ? AND seq = ?",
+                                    (symbol, date_text, event.seq),
+                                )
+                        except DomainError as exc:
+                            with self._write_transaction() as connection:
+                                self._pause_locked(
+                                    connection, symbol, date_text,
+                                    exc.code, event.seq, exc.message,
+                                )
+                            return CommitOutcome(
+                                committed=committed,
+                                paused=True,
+                                pause_reason=exc.code,
+                                pause_seq=event.seq,
+                                pause_detail=exc.message,
+                            )
+                        else:
+                            committed += 1
+                else:
+                    committed += len(run)
+
+    def collector_status(self, symbol: str, trade_date: date) -> dict:
+        date_text = trade_date.isoformat()
+        with self._lock:
+            row = self._collector_row(self._conn, symbol, date_text)
+            if row is None:
+                raise DomainError(
+                    404, "collector_not_found",
+                    "no collector for this symbol and date",
+                )
+            return self._status_locked(symbol, date_text, row)
+
+    def list_collector_statuses(self) -> list[dict]:
+        with self._lock:
+            return [
+                self._status_locked(row["symbol"], row["trade_date"], row)
+                for row in self._conn.execute(
+                    "SELECT * FROM collectors ORDER BY symbol, trade_date"
+                ).fetchall()
+            ]
+
+    def _status_locked(
+        self, symbol: str, date_text: str, row: sqlite3.Row
+    ) -> dict:
+        watermark = self._watermark(self._conn, symbol, date_text)
+        pending = self._conn.execute(
+            "SELECT COUNT(*) AS count, MAX(seq) AS max_seq FROM pending_events"
+            " WHERE symbol = ? AND trade_date = ?",
+            (symbol, date_text),
+        ).fetchone()
+        return {
+            **self._collector_payload(row),
+            "watermark": watermark,
+            "pending_events": int(pending["count"]),
+            "buffered_max_seq": pending["max_seq"],
         }
 
 

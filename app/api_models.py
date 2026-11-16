@@ -72,6 +72,40 @@ class HealthResponse(BaseModel):
     database: str
 
 
+class CollectionStatusResponse(BaseModel):
+    symbol: str
+    trade_date: date
+    status: Literal["running", "paused"]
+    pause_reason: str | None = Field(
+        description="Machine-readable cause when paused, e.g. sequence_conflict"
+    )
+    pause_seq: int | None = Field(
+        description="Sequence number that caused the pause, when applicable"
+    )
+    pause_detail: str | None
+    watermark: int = Field(
+        description="Committed high-water mark; collection progress never exceeds it"
+    )
+    pending_events: int = Field(
+        description="Received messages buffered but not yet committed"
+    )
+    buffered_max_seq: int | None = Field(
+        description="Highest sequence number currently buffered"
+    )
+    source_latest_seq: int | None = Field(
+        description="Highest sequence the backfill source reported so far"
+    )
+    udp_port: int
+    source_url: str
+    poll_interval_seconds: float
+    created_at: str
+    updated_at: str
+
+
+class CollectionListResponse(BaseModel):
+    collections: list[CollectionStatusResponse]
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str

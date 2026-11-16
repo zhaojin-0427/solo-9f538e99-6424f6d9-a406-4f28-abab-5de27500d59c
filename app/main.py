@@ -18,6 +18,8 @@ from pydantic import AfterValidator, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .api_models import (
+    CollectionListResponse,
+    CollectionStatusResponse,
     ErrorResponse,
     HealthResponse,
     PublishResponse,
@@ -26,8 +28,14 @@ from .api_models import (
     UploadResponse,
     VersionsResponse,
 )
+from .collector import CollectorManager
 from .errors import DomainError
-from .schemas import UploadRequest, normalize_symbol, prepare_events
+from .schemas import (
+    CollectionStartRequest,
+    UploadRequest,
+    normalize_symbol,
+    prepare_events,
+)
 from .store import MAX_EVENTS_PER_DAY, Store
 
 MAX_BODY_BYTES = 2 * 1024 * 1024
@@ -62,6 +70,21 @@ minute OHLCV bars for backtesting.
   the next publication, while the older version remains queryable by version.
 * Uploading and publishing are serialised: one version uses exactly one
   watermark, and a failed batch leaves no partial version.
+
+### Realtime collection (`POST /collections`, `GET /collections/...`)
+* One collector per symbol/day receives UDP datagrams (same message format)
+  and backfills gaps by sequence number from an HTTP source that retains the
+  full day; on start and after a restart it catches up to the source's
+  highest sequence.
+* Out-of-order and duplicate messages are buffered, never stored twice; only
+  a contiguous, rule-valid prefix is committed (same trade/correction/cancel
+  rules and the same 100-message daily cap), so progress never exceeds the
+  committed watermark.
+* A same-sequence message with different content — against committed data or
+  the persisted buffer, even after a restart — pauses the collector and
+  reports the sequence number; committed data is never overwritten.
+* While the backfill source is down, realtime messages keep buffering; the
+  next successful poll fills the gap automatically.
 """
 
 
@@ -72,10 +95,14 @@ def _database_path() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Iterator[None]:
     store = Store(_database_path())
+    manager = CollectorManager(store)
     app.state.store = store
+    app.state.collector_manager = manager
+    await manager.load_all()
     try:
         yield
     finally:
+        await manager.shutdown()
         store.close()
 
 
@@ -87,6 +114,7 @@ app = FastAPI(
     lifespan=lifespan,
     openapi_tags=[
         {"name": "ingest", "description": "Append exchange messages"},
+        {"name": "collect", "description": "Realtime collection with gap backfill"},
         {"name": "bars", "description": "Publish and read versioned minute bars"},
         {"name": "ops", "description": "Health and version introspection"},
     ],
@@ -95,6 +123,10 @@ app = FastAPI(
 
 def get_store(request: Request) -> Store:
     return request.app.state.store
+
+
+def get_manager(request: Request) -> CollectorManager:
+    return request.app.state.collector_manager
 
 
 def _parse_upload_body(raw: bytes) -> UploadRequest:
@@ -309,6 +341,94 @@ def versions(
     return VersionsResponse.model_validate(
         get_store(request).versions(symbol, trade_date)
     )
+
+
+# -- realtime collection ----------------------------------------------------
+SymbolPath = Annotated[
+    str, PathParam(min_length=1, max_length=64), AfterValidator(normalize_symbol)
+]
+
+
+@app.post(
+    "/collections",
+    response_model=CollectionStatusResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        200: {
+            "model": CollectionStatusResponse,
+            "description": "Collector already existed; running collector returned"
+            " unchanged, paused collector resumed",
+        },
+        409: {
+            "model": ErrorResponse,
+            "description": "Conflicting collector settings or UDP port in use",
+        },
+        422: {"model": ErrorResponse, "description": "Invalid request"},
+    },
+    tags=["collect"],
+)
+async def start_collection(
+    request: Request, response: Response, payload: CollectionStartRequest
+) -> CollectionStatusResponse:
+    status_dict, created = await get_manager(request).start_collector(
+        payload.symbol,
+        payload.trade_date,
+        payload.udp_port,
+        payload.source_url,
+        payload.poll_interval_seconds,
+    )
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    return CollectionStatusResponse.model_validate(status_dict)
+
+
+@app.get(
+    "/collections",
+    response_model=CollectionListResponse,
+    tags=["collect"],
+)
+def list_collections(request: Request) -> CollectionListResponse:
+    return CollectionListResponse(
+        collections=[
+            CollectionStatusResponse.model_validate(item)
+            for item in get_store(request).list_collector_statuses()
+        ]
+    )
+
+
+@app.get(
+    "/collections/{symbol}/{trade_date}",
+    response_model=CollectionStatusResponse,
+    responses={404: {"model": ErrorResponse, "description": "No collector"}},
+    tags=["collect"],
+)
+def collection_status(
+    request: Request,
+    symbol: SymbolPath,
+    trade_date: Annotated[date_type, PathParam()],
+) -> CollectionStatusResponse:
+    return CollectionStatusResponse.model_validate(
+        get_store(request).collector_status(symbol, trade_date)
+    )
+
+
+@app.delete(
+    "/collections/{symbol}/{trade_date}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={404: {"model": ErrorResponse, "description": "No collector"}},
+    tags=["collect"],
+)
+async def stop_collection(
+    request: Request,
+    symbol: SymbolPath,
+    trade_date: Annotated[date_type, PathParam()],
+) -> Response:
+    stopped = await get_manager(request).stop_collector(symbol, trade_date)
+    if not stopped:
+        raise DomainError(
+            404, "collector_not_found", "no collector for this symbol and date"
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 def _openapi() -> dict[str, Any]:

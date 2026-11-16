@@ -209,6 +209,58 @@ class EventInput:
     quantity: int | None
 
 
+class CollectionStartRequest(BaseModel):
+    """Start (or resume) realtime collection for one symbol and UTC day."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "symbol": "DEMO",
+                    "trade_date": "2024-01-02",
+                    "udp_port": 9001,
+                    "source_url": "http://source:8001",
+                    "poll_interval_seconds": 2.0,
+                }
+            ]
+        },
+    )
+
+    symbol: str = Field(min_length=1, max_length=64)
+    trade_date: date = Field(description="UTC trading date (YYYY-MM-DD)")
+    udp_port: Annotated[
+        int,
+        Field(
+            ge=0, le=65535,
+            description="Local UDP port for realtime datagrams; 0 picks an ephemeral port",
+        ),
+    ]
+    source_url: str = Field(
+        min_length=1, max_length=512,
+        description="Base URL of the HTTP source retaining the full day",
+    )
+    poll_interval_seconds: Annotated[
+        float,
+        Field(gt=0, le=60, description="Delay between backfill catch-up passes"),
+    ] = 2.0
+
+    @field_validator("symbol")
+    @classmethod
+    def _valid_symbol(cls, value: str) -> str:
+        return normalize_symbol(value)
+
+    @field_validator("source_url")
+    @classmethod
+    def _valid_source_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("source_url must start with http:// or https://")
+        if any(ch.isspace() for ch in value):
+            raise ValueError("source_url must not contain whitespace")
+        return value
+
+
 def prepare_events(messages: list[MarketMessage], trade_date: date) -> list[EventInput]:
     """Normalise messages (UTC instants, exact decimal text) before any write.
 
